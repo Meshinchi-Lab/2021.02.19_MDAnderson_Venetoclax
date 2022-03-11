@@ -1,0 +1,626 @@
+---
+title: "DE Analysis of Venetoclax Responders vs NonResponders"
+author: "Jenny Smith"
+date: "2/19/21"
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2021.02.19_MDAnderson_Venetoclax"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(patchwork)
+library(gridExtra)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+
+getwd()
+```
+
+
+#ClinData
+
+```{r}
+MDA_CDEs <- read.csv(file.path(TARGET,"Clinical/CDE/MDAnderson/Soheil_Rhonda_MDA_venetoclax_clinical_data_for_analysis_updated.csv"),
+                     na.strings = c("NA","N/A","#N/A", "", ".")) %>% 
+  mutate(Sample=gsub("-","\\.", Barcode)) %>% 
+  dplyr::select(UPI, Barcode, Sample, everything())
+
+head(MDA_CDEs)
+dim(MDA_CDEs) #63 35
+```
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_03.17.21.csv"))
+
+ineligables <-   filter(merged, Eligibility_Comments == "remove")
+
+merged <- merged %>% 
+  filter(!is.na(USI), USI != "Unknown")  %>% 
+  filter(Eligibility_Comments != "remove")
+
+
+dim(merged)
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_02.04.21.csv"))
+
+head(sample_info)
+dim(sample_info)
+```
+
+```{r}
+fusions <- read.csv(file.path(PROJHOME,"2020.08.31_Concatentate_Remission_MDA_APL_TransAbyss_Fusion/reformatted/TARGET_AML_remission_MDA_APL_TransAbyss_Fusions_reformatted_FilteredForNBM_PrimaryFusions_04.02.21.csv"))
+
+dim(fusions)
+```
+
+```{r}
+TCGA <- read.csv(file.path(LAML, "Clinical/CDE/TCGA_AML_updated_NEJM_SuppTable01_12.28.20.csv")) 
+
+dim(TCGA)
+head(TCGA)
+```
+
+
+
+#Clean MDA CDEs 
+
+Notes on CDEs:
+MRD LS: no call as neg or pos, just poor specimen…..let’s us know there was a sample.
+MRD- LS: Called negative, but on a poor specimen
+
+
+DXDate (time of diagnosis)
+Relapse Date (time of relapse, if any)
+LFUDate (last follow-up date)
+VitalStatus (Alive/Dead)
+
+Best.Co = Best#Co, best course number for best response
+
+```{r}
+addl.data <- read.csv(file.path(TARGET,"Clinical/CDE/MDAnderson/Soheil_Rhonda_MDA_venetoclax_clinical_data_deidentified.csv"),
+                      na.strings = c("NA","N/A","#N/A", "", ".")) %>%
+  mutate(Sample=gsub("-","\\.", Barcode)) %>% 
+  dplyr::select(UPI, Barcode, Sample, everything())
+
+
+head(addl.data)
+missingCols <- setdiff(colnames(addl.data), colnames(MDA_CDEs))
+```
+
+```{r}
+# as.Date(MDA_CDEs$LFUDate, format=c("%m/%d/%y")) - as.Date(MDA_CDEs$DXDate,format=c("%m/%d/%y"))
+# table(MDA_CDEs$VitalStatus)
+
+
+# MDA_CDEs$LFUDate
+# addl.data$Relapse.Date
+```
+
+
+```{r}
+MDA_CDEs.update <- MDA_CDEs %>% 
+  left_join(., select(addl.data,Sample,all_of(missingCols)),
+            by="Sample") %>% 
+  
+  #Reformat dates
+  mutate_at(vars(DXDate,LFUDate,Relapse.Date), 
+            ~as.Date(., format=c("%m/%d/%y"))) %>% 
+  mutate_at(vars(Relapse.Date),
+            ~case_when(
+              grepl("Alive", VitalStatus) & is.na(Relapse.Date) ~ LFUDate, 
+              TRUE ~ .)) %>% 
+  
+  
+  #Calculate time-to-event and event columns
+  mutate(Time.to.OS.inDays=LFUDate-DXDate,
+         Time.to.EFS.inDays=Relapse.Date-DXDate,
+         OS.ID=ifelse(grepl("Alive", VitalStatus), 0, 1),
+         #Event.ID is probably incorrect. will need to fix.
+         Event.ID=ifelse(grepl("relapse|Failed", OffStudyReason), 1, OS.ID),
+         MRD.Status=case_when(
+           grepl("MRD-", BestRespComment) ~ "Negative",
+           grepl("MRD+", BestRespComment) ~ "Positive",
+           grepl("MRD ND|MRD LS", BestRespComment) | is.na(BestRespComment) ~ "Unknown",
+           TRUE ~ "Unknown")) %>%
+  mutate(Mutation_Group=case_when(
+    grepl("DNMT3A", Pre.Rx.MDL.Comment..Mutations.only.) ~ "DNMT3A",
+    #Only 1 of these 
+    # grepl("FLT3-ITD", Pre.Rx.MDL.Comment..Mutations.only.) & grepl("WT1", Pre.Rx.MDL.Comment..Mutations.only.) ~ "FLT3-ITD/WT1",
+    grepl("FLT3-ITD", Pre.Rx.MDL.Comment..Mutations.only.) ~ "FLT3-ITD",
+    grepl("IDH", Pre.Rx.MDL.Comment..Mutations.only.) ~ "IDH1/2",
+    grepl("TP53", Pre.Rx.MDL.Comment..Mutations.only.) ~ "TP53",
+    # grepl("CEBPA", Pre.Rx.MDL.Comment..Mutations.only.) ~ "CEBPA",
+    # grepl("NPM1", Pre.Rx.MDL.Comment..Mutations.only.) ~ "NPM1",
+    grepl("ASXL", Pre.Rx.MDL.Comment..Mutations.only.) ~ "ASXL1/2",
+    TRUE ~ "OtherAML")) %>% 
+
+
+  #Define Responders vs NonResponders
+  mutate(Venetoclax.Responder=case_when(
+    BestResponse == "CR" & Best.Co == 1  & MRD.Status =="Negative" ~ "Responder",
+    
+    grepl("NR", BestResponse) ~ "nonResponder",
+    grepl("CR", BestResponse) & Best.Co > 2 ~ "nonResponder",
+    
+    BestResponse == "CR" & Best.Co == 1 & MRD.Status == "Positive" ~ "intermediateResponder",
+    grepl("CR", BestResponse) & Best.Co == 2 ~ "intermediateResponder",
+    grepl("CRi|HI", BestResponse) & Best.Co == 1 ~ "intermediateResponder",
+    grepl("Died", BestResponse) ~ "Unknown",
+    TRUE ~ "Unknown"))
+
+
+dim(MDA_CDEs.update)
+```
+
+```{r}
+# MDA_CDEs.update$Time.to.OS.inDays
+# MDA_CDEs.update$Time.to.EFS.inDays
+table(MDA_CDEs.update$MRD.Status)
+table(MDA_CDEs.update$Venetoclax.Responder)
+# table(MDA_CDEs.update$OS.ID)
+# table(MDA_CDEs.update$Event.ID)
+# table(MDA_CDEs.update$Mutation_Group)
+
+# write.csv(MDA_CDEs.update, "MDAnderson_AML_CDEs_Cleaned_2.19.21.csv", row.names = FALSE)
+
+# table(MDA_CDEs.update$Pre.Rx.CG.Group)
+# table(MDA_CDEs.update$Pre.Rx.MDL.Comment..Mutations.only.)
+# sum(grepl("DNMT3A", MDA_CDEs.update$Pre.Rx.MDL.Comment..Mutations.only.) & grepl("FLT3-ITD", MDA_CDEs.update$Pre.Rx.MDL.Comment..Mutations.only.)) #Only 4 
+```
+
+
+# Clean the Fusion Data
+
+```{r}
+# table(fusions$Group)
+# table(sample_info$Group)
+TCGA
+
+#About 80 patients with fusions detected in TCGA, so like 40% of samples 
+table(!grepl("^$|^\\s$", TCGA$Gene.Fusions.by.RNA.Seq))
+
+```
+
+```{r}
+TCGA_fusions <- TCGA %>% 
+  select(TCGA.Patient.ID,Gene.Fusions.by.RNA.Seq, Cytogenetics, Inferred.genomic.rearrangement..from.RNA.Seq.fusion.)  %>% 
+  separate(Gene.Fusions.by.RNA.Seq, into = c("Primary.Fusion", "Additional.Fusions"), 
+           sep=",", extra="merge", fill="right",
+           remove=FALSE) %>% 
+  mutate_at(vars(Primary.Fusion,Additional.Fusions), ~gsub("\\(|\\)|\\+|\\-|\\(2\\)|\\*|\\(2\\s", " ", .)) %>% 
+  mutate_at(vars(Primary.Fusion,Additional.Fusions), ~gsub("In [Ff]rame|[Oo]ut of [Ff]rame", "", .)) %>% 
+  
+  mutate_at(vars(Primary.Fusion,Additional.Fusions), ~gsub("\\s{1,}$", "", .)) %>% 
+  mutate_at(vars(Primary.Fusion,Additional.Fusions), ~gsub("\\s{2,}", " ", .)) %>% 
+  mutate_at(vars(Primary.Fusion,Additional.Fusions), ~gsub("\\s", "-", .)) %>% 
+  mutate_at(vars(Additional.Fusions), ~gsub("-,", "; ", .)) %>% 
+  mutate_at(vars(Additional.Fusions), ~gsub("^-", "", .)) %>% 
+  mutate_at(vars(Primary.Fusion,Additional.Fusions), ~gsub("^MLL-", "KMT2A-", .)) %>% 
+  mutate_at(vars(Primary.Fusion,Additional.Fusions), ~gsub("-MLL$", "-KMT2A", .)) %>%
+  mutate_at(vars(Primary.Fusion,Additional.Fusions), ~gsub("-MLL;", "-KMT2A;", .)) %>% 
+  select(TCGA.Patient.ID,Primary.Fusion, Additional.Fusions, everything())
+  
+
+# TCGA_fusions
+```
+
+
+```{r}
+fusions_list <- read.csv("Fusions/Fusions_of_Interest.csv", head=FALSE) 
+fusions_list_multiple <- read.csv("Fusions/Fusions_with_Multiple_Partners.csv", header=FALSE)
+```
+
+
+```{r}
+tcga.regex <- TCGA_fusions %>% 
+  select(Primary.Fusion, Additional.Fusions) %>% 
+  unlist() %>% 
+  str_split_fixed(., pattern = "; ", n=6) %>% 
+  as.data.frame() %>% 
+  gather("ColumnNumber", "Fusion") %>% 
+  filter(Fusion != "") %>% 
+  separate(Fusion, c("GeneA","GeneB"), sep="-", remove = FALSE) %>% 
+  mutate(regex=paste(paste(GeneB,GeneA, sep="-"), 
+                     paste(GeneA, GeneB, sep="-"), sep="|")) %>% 
+  pull(regex) %>%
+  unique() %>% 
+  paste(., collapse = "|")
+
+# tcga.regex
+
+FOI.pairs_regex <- fusions_list %>%
+  separate(V1, c("GeneA","GeneB"), sep="-",remove = FALSE) %>% 
+  mutate(regex=paste(paste(GeneB,GeneA, sep="-"), 
+                     paste(GeneA, GeneB, sep="-"), sep="|")) %>% 
+  pull(regex) %>% 
+  unique()
+
+# FOI.pairs_regex
+
+FOI.mp_regex <- fusions_list_multiple %>%
+  add_row(V1=c(paste0("HOXA",1:11),
+               paste0("HOXB", 1:11))) %>%
+  mutate(leftGene=paste0("^", V1, "-"), 
+         rightGene=paste0("-", V1,"$")) %>%
+  unite(Regex, leftGene, rightGene, sep = "|") %>%
+  select(Regex) %>% 
+  unlist() %>%
+  paste(., collapse = "|")
+
+# FOI.mp_regex
+```
+
+```{r}
+MDA_fusions <- fusions %>% 
+  filter(grepl("Adult AML .MDA.", Group), !grepl("CBFGLIS", Sample)) %>% 
+  filter(grepl(FOI.pairs_regex, Fusion.Category) | grepl(FOI.mp_regex, Fusion.Category) | grepl(tcga.regex, Fusion.Category)) %>% 
+  arrange(Fusion.Category) %>% 
+  
+  left_join(., select(MDA_CDEs.update,Sample, Pre.Rx.Cytogenetics, Age.at.Collection, 
+                      Pre.Rx.MDL.Comment..Mutations.only.),
+            by="Sample") %>% 
+  select(Sample:AML_Subtype, Pre.Rx.Cytogenetics:Pre.Rx.MDL.Comment..Mutations.only., everything(), -Age.in.years, -ISCN, -Fusion.Category)
+
+
+
+MDA_fusions
+dim(MDA_fusions) #34 fusions
+length(unique(MDA_fusions$Sample)) #27 unique samples out of 110 samples (so ~25% of samples) 
+
+# write.csv(MDA_fusions, "Fusions/MDAnderson_AML_TransAbyss_Known_Fusions_Subset.csv", row.names = FALSE)
+```
+
+
+
+#Raw Counts
+
+```{r}
+cts <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/BCCA_GRCh37_Ensembl_v69/TARGET_AML_MPN_DS_NBM_3044Samples_Ribodepleted_RNAseq_geneLevel_dupGenesRemoved_FractionalCounts.RDS"))
+
+gene_ids <- cts[,c(1:2)]
+cts <- as.data.frame(cts)
+rownames(cts) <- cts$geneSymbol
+cts <- cts[,-c(1:2)]
+
+head(cts[,1:5])
+dim(cts) #51573  3044
+```
+
+
+# Define Samples
+
+```{r}
+MDA_samples <- sample_info %>% 
+  filter(Group=="Adult AML (MDA)" |
+         grepl("NBM|CD34_PB", Group)) %>% 
+  left_join(., MDA_CDEs.update, by="Sample") %>% 
+  mutate_at(vars(Venetoclax.Responder), ~case_when(
+    is.na(.) & Group == "Adult AML (MDA)" ~ "Unknown", 
+    is.na(.) &  grepl("NBM|CD34", Group) ~ Group,
+    TRUE ~ .)) %>% 
+  mutate_at(vars(Pre.Rx.CG.Group, Mutation_Group), ~case_when(
+    is.na(.) &  grepl("NBM|CD34", Group) ~ Group,
+    is.na(.) & Group == "Adult AML (MDA)" ~ "OtherAML", 
+    grepl("Insufficient Metaphases|Miscellaneous", .) ~ "OtherAML", 
+    TRUE ~ .)) %>% 
+  set_rownames(.$Sample)
+
+
+# MDA_samples
+dim(MDA_samples)
+table(MDA_samples$Group)
+# table(MDA_samples$Time_point) 
+```
+
+```{r}
+table(MDA_samples$Venetoclax.Responder, 
+      MDA_samples$Group)
+
+table(MDA_samples$Mutation_Group)
+table(MDA_samples$Pre.Rx.CG.Group)
+```
+
+```{r}
+setdiff(MDA_CDEs$UPI, MDA_samples$USI) #6840710 missing?
+grep("6840710", sample_info$USI)
+grep("6840710", colnames(cts))
+```
+
+
+# Subset the Counts
+
+```{r}
+cts_MDA <- cts[,MDA_samples$Sample]
+
+dim(cts_MDA)
+```
+
+
+
+# Unsupervised Clustering
+
+```{r}
+Cols <- c("Mutation_Group", "Pre.Rx.CG.Group", "Venetoclax.Responder")
+```
+
+```{r}
+cc <- colorCodes_aheatmap(MDA_samples[,Cols])
+
+# cc
+```
+
+```{r}
+pca_res <- lapply(Cols, function(x){
+  
+  pheno <- MDA_samples[[x]] %>% 
+    set_names(MDA_samples$Sample)
+
+  PCA(expnData = cts_MDA[,names(pheno)],
+               phenovector = pheno,
+               colorCodes = cc[[x]],
+               title = paste("MDAnderson AML", x),
+               round = TRUE,
+               ntop = 1000,
+               PC3 = TRUE)
+  
+})
+
+names(pca_res) <- Cols
+```
+
+```{r fig.width=12, fig.height=5}
+# pdf("MDAnderson_and_NBM_MutationGroup_Top1000_MostVariedGenes_PCA.pdf", height = 5, width = 12)
+pca_res$Mutation_Group$pca_plot + pca_res$Mutation_Group$pca_plot2
+# dev.off()
+```
+
+```{r fig.width=12, fig.height=5}
+# pdf("MDAnderson_and_NBM_CytoGroup_Top1000_MostVariedGenes_PCA.pdf", height = 5, width = 12)
+pca_res$Pre.Rx.CG.Group$pca_plot + pca_res$Pre.Rx.CG.Group$pca_plot2
+# dev.off()
+```
+
+```{r fig.width=12, fig.height=5}
+# pdf("MDAnderson_and_NBM_VenetoclaxGroup_Top1000_MostVariedGenes_PCA.pdf", height = 5, width = 12)
+pca_res$Venetoclax.Responder$pca_plot + pca_res$Venetoclax.Responder$pca_plot2
+# dev.off()
+```
+
+
+```{r}
+suppressPackageStartupMessages(library(plotly))
+```
+
+```{r}
+umap_res <- list(umap_res=pca_res$Venetoclax.Responder$pca_data %>% 
+                   select(Sample=name, group, x=PC1,y=PC2, z=PC3) %>% 
+                   left_join(., MDA_samples, by="Sample"))
+
+colors <- c(brewer.pal(6, "Set1")) %>% 
+  set_names(., unique(umap_res$umap_res$Venetoclax.Responder))
+colors["Unknown"] <- "grey80"
+
+scatter3d <- scatter_plots_3d(umap_workflow_res = umap_res, 
+                              Group_Column = "Venetoclax.Responder",
+                              Cols = c("Sample",
+                                      "AML_Subtype",
+                                      "Tissue","Pre.Rx.CG.Group",
+                                      "Venetoclax.Responder",
+                                      "Mutation_Group",
+                                      "BestResponse"),
+                              cc = colors,
+                              blackbg = FALSE,
+                              ptsize = 4,
+                              axis_titles = paste("PC", 1:3))
+
+scatter3d
+```
+
+```{r}
+# bgcol <- rgb(1,1,1)
+# htmlwidgets::saveWidget(as_widget(scatter3d),
+#                         "MDAnderson_AML_Venetoclax_Response_3Dscatter_PCA.html",
+#                         selfcontained = TRUE,
+#                         background = bgcol)
+```
+
+
+## UMAP
+
+```{r}
+cts_MDA <- cts[, MDA_samples$Sample]
+cts_MDA <- as.matrix(cts_MDA[rowSums(cts_MDA)>= 10, ])
+
+dim(cts_MDA) #37827   211
+
+# lapply(Cols, function(x) table(sample_info[samps_NUP98$Sample,x],
+#                                useNA='ifany'))
+```
+
+```{r}
+#TFIDF TRANSFORMED Counts
+# Term Frequency - Inverse Document Frequency (TF-IDF) 
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6101073/
+cell_total <- apply(cts_MDA, 2, sum)
+geomean <- exp(mean(log(cell_total)))
+sf <- cell_total/geomean
+sf.scaled <- t(t(cts_MDA)/sf)
+
+#There is something wrong with my Rpackage build...
+source(file.path(SCRIPTS,"RNAseq_Analysis/DifferentialExpn_PathwayAnalysis/R/UMAP_workflow.R"))
+tf_MDA <- tf_idf_transform(as.matrix(sf.scaled))
+tf_MDAlog <- tf_idf_transform(log2(sf.scaled+1))
+
+gc()
+
+# Mean vs Dispersion Feature Selection 
+obj <- seqGlue::calc_dispersion(cts_MDA, removeOutliers = TRUE) #removes outlier genes/transcripts based on cooks distance
+gc()
+```
+
+```{r}
+sg_MDA <- seqGlue::get_selected_genes(seqGlue::select_genes(obj, top_n=1000))
+tf_MDA <- tf_MDA[sg_MDA,]
+tf_MDAlog <- tf_MDAlog[sg_MDA,]
+
+dim(tf_MDA) 
+dim(tf_MDAlog) 
+```
+
+```{r}
+round(quantile(tf_MDA), digits = 5)
+round(quantile(tf_MDAlog), digits=5)
+```
+
+
+```{r}
+cols <- c("AML_Subtype", "Tissue","Pre.Rx.CG.Group", "Venetoclax.Responder","Mutation_Group",  "BestResponse")
+
+cc <- colorCodes_aheatmap(df=MDA_samples[,cols])
+cc$Venetoclax.Responder <- c(brewer.pal(6, "Set1")) %>% 
+  set_names(., unique(MDA_samples$Venetoclax.Responder))
+cc$Venetoclax.Responder["Unknown"] <- "grey80"
+
+
+Extra_Colors <- c(brewer.pal(9, "Set1"), brewer.pal(8, "Set2"), brewer.pal(8,"Dark2"))
+
+# n_neighbors: Larger values result in more global views of the manifold, while smaller values result in more local data being preserved. In general values should be in the range 2 to 100.
+#min_dist:  Smaller values will result in a more clustered/clumped embedding where nearby points on the manifold are drawn closer together, while larger values will result on a more even dispersal of points.
+
+umap_MDA_NBM <- UMAP_workflow(TFIDF_Matrix = tf_MDA, 
+                            input_features=sg_MDA, 
+                            samples_vector = MDA_samples$Sample,
+                            sample_info_df = MDA_samples,
+                            Columns_for_Plots = cols,
+                            cc = cc, 
+                            min_dist=0.005,
+                            n_neighbors=15,
+                            k2=12,
+                            res2=0.01,
+                            addl_color_vector=Extra_Colors)
+
+```
+
+
+```{r fig.height=7, fig.width=5}
+umap_MDA_NBM$umap_2D_scatter
+```
+
+```{r}
+scatter3d <- scatter_plots_3d(umap_workflow_res = umap_MDA_NBM, 
+                              Group_Column = "Venetoclax.Responder",
+                              Cols = c("Sample",
+                                      "AML_Subtype",
+                                      "Tissue","Pre.Rx.CG.Group",
+                                      "Venetoclax.Responder",
+                                      "Mutation_Group",
+                                      "BestResponse"),
+                              cc = cc$Venetoclax.Responder,
+                              blackbg = FALSE,
+                              ptsize = 4)
+
+scatter3d
+```
+
+```{r}
+# bgcol <- rgb(1,1,1)
+# htmlwidgets::saveWidget(as_widget(scatter3d),
+#                         "MDAnderson_AML_Venetoclax_Response_3Dscatter_UMAP.html",
+#                         selfcontained = TRUE,
+#                         background = bgcol)
+```
+
+
+
+## PCA Without NBM 
+
+```{r}
+pheno2 <- MDA_samples %>% 
+  filter(grepl("MDA", Group)) %>% 
+  pull(Venetoclax.Responder, Sample)
+
+pca_res_onlyAML <- PCA(expnData = cts_MDA[, names(pheno2)],
+               phenovector = pheno2,
+               title = "MDAnderson AML",
+               round = TRUE,
+               ntop = 1000,
+               PC3 = TRUE)
+```
+
+```{r fig.width=12, fig.height=5}
+# pdf("MDAnderson_and_NBM_Top1000_MostVariedGenes_PCA.pdf", height = 5, width = 12)
+pca_res$pca_plot + pca_res$pca_plot2
+# dev.off()
+```
+
+
+#Perform Differential Expression
+
+```{r}
+RvsNR.df <- MDA_samples[grepl("^Responder$|^nonResponder$", MDA_samples$Venetoclax.Responder), ]
+RvsNR.df$Venetoclax.Responder <- gsub("nonResponder", "NR", RvsNR.df$Venetoclax.Responder)
+
+DE_RvsNR <- twoGroups_DEGs(expnData = cts_MDA[,RvsNR.df$Sample],
+                           clinData = RvsNR.df,
+                           col = "Venetoclax.Responder",
+                           ref = "NR",
+                           percent.cutoff = 0.05,
+                           anno = FALSE,Custom.Cols = Cols)
+```
+
+```{r}
+names(DE_RvsNR)
+
+table(DE_RvsNR$phenovector)
+# DE_RvsNR$InputClinData %>% 
+#   select(Sample, Venetoclax.Responder)
+```
+
+```{r}
+# pdf("MDAnderson_Responder_vs_NonResponder_PCA.pdf", height = 5, width = 7)
+DE_RvsNR$PCA$pca_plot
+# dev.off()
+```
+
+
+#QC Plots 
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,146 @@
+---
+title: "Run RSeQC"
+author: "Jenny Smith"
+date: "4/15/21"
+output: html_document
+---
+
+# Set-up 
+
+```{r setup, cache = FALSE, include = FALSE}
+require(knitr)
+knitr::opts_knit$set(root.dir = file.path(PROJHOME,"2021.02.19_MDAnderson_Venetoclax"))
+```
+
+```{r}
+knitr::opts_chunk$set(tidy.opts=list(width.cutoff=50),
+                      tidy=TRUE,
+                      fig.align='center',
+                      fig.width = 10, fig.height = 10)
+node=Sys.info()[["nodename"]]
+if(!grepl("local", node)){
+  print(node)
+  options(bitmapType = 'cairo')
+  grDevices::X11.options(type='cairo')
+}
+
+options(stringsAsFactors = FALSE)
+table = function (..., useNA = 'ifany') base::table(..., useNA = useNA)
+```
+
+```{r message = FALSE, warning=FALSE}
+library(stringr)
+library(magrittr)
+
+library(ggplot2)
+library(gridExtra)
+
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+
+library(DeGSEA)
+
+getwd()
+```
+
+
+#Raw Counts
+
+```{r eval=FALSE}
+cts <- readRDS(file.path(PROJHOME, "0000.00.03_ExpressionMatrices/BCCA_GRCh37_Ensembl_v69/TARGET_AML_MPN_DS_NBM_3044Samples_Ribodepleted_RNAseq_geneLevel_dupGenesRemoved_FractionalCounts.RDS"))
+
+gene_ids <- cts[,c(1:2)]
+cts <- as.data.frame(cts)
+rownames(cts) <- cts$geneSymbol
+cts <- cts[,-c(1:2)]
+
+head(cts[,1:5])
+dim(cts) #51573  3044
+```
+
+
+#ClinData
+
+```{r}
+merged <- read.csv(file.path(CDE,"Merged/TARGET_AML_0531_1031_merged_CDEs_03.17.21.csv"))
+
+merged <- merged %>% 
+  filter(!is.na(USI), USI != "Unknown") %>% 
+  filter(Eligibility_Comments != "remove")
+
+
+dim(merged)
+```
+
+```{r}
+sample_info <- read.csv(file.path(TARGET, "SequencingDataMatrix/TARGET_AML_Ribodepleted_Manifest_02.04.21.csv")) 
+```
+
+# File Manifest
+
+```{r}
+library(aws.s3)
+library(aws.signature)
+```
+
+```{r}
+#Set-up config
+creds <- aws.signature::use_credentials(profile = "default")
+Sys.setenv("AWS_ACCESS_KEY_ID" = creds$default$AWS_ACCESS_KEY_ID,
+           "AWS_SECRET_ACCESS_KEY" = creds$default$AWS_SECRET_ACCESS_KEY,
+           "AWS_DEFAULT_REGION"="us-west-2")
+
+
+blist <- bucketlist()
+blist
+
+BUCKET="fh-pi-meshinchi-s-eco-public"
+PREFIX="TARGET_AML/RNAseq_Illumina_Data/BAM"
+
+bams <- get_bucket_df(bucket = BUCKET,
+                      prefix = PREFIX,
+                      max = Inf)
+head(bams) #7338    8
+dim(bams)
+```
+
+```{r}
+sample_sheet <- bams %>% 
+  select(BAM=Key) %>%
+  filter(grepl(".bam$|.bai$", BAM)) %>% 
+  mutate(File=str_split_fixed(gsub("\\.ba.+","",BAM), pattern="/",n=4)[,4]) %>% 
+  group_by(File) %>% 
+  mutate(Has_Index= n()==2) %>% 
+  ungroup()  %>% 
+  filter(Has_Index) %>% 
+  select(Files=BAM) %>% 
+  mutate(Sample=str_split_fixed(gsub(".srt.+","",Files), pattern="/",n=4)[,4]) %>% 
+  mutate(Filetype=ifelse(grepl(".bam$", Files),"BAM", "INDEX")) %>%  
+  # spread(key=Filetype, value=Files)
+  pivot_wider(id_cols = Sample,  names_from = Filetype, values_from = Files) %>% 
+  mutate_at(vars(BAM, INDEX), ~paste0("s3://", BUCKET,"/", .)) %>% 
+  slice(1:10)
+  
+
+
+head(sample_sheet)
+# table(sample_sheet$Has_Index)
+
+dim(sample_sheet) #50  2
+# write.table(sample_sheet,file.path(SCRIPTS, "STAR-fusion-NF/sample_sheets/CellLines_Sample_Sheet.txt"), row.names = F, quote=F, sep="\t")
+```
+
+# QC Data
+
+
+#QC Plots 
+
+
+#Session Information
+
+```{r}
+sessionInfo()
+```
+
